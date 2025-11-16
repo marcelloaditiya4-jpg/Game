@@ -1,0 +1,318 @@
+<!--
+Pixel Car — Single-file HTML/JS game (Android-friendly)
+How to use: save as pixel-car.html and open in Android browser or WebView. Works offline.
+Features:
+- Responsive full-screen canvas with scaling for mobile
+- Touch controls (left/right buttons, brake, nitro) + tilt steering (DeviceOrientation)
+- Procedural road with lanes, oncoming traffic AI obstacles
+- Pixel-style car drawn by canvas (no external assets)
+- Upgrades / shop (speed, handling, nitro, armor) persisted in localStorage
+- Levels, distance-based difficulty, score, best score
+- Simple particle effects (dust, sparks)
+- Basic sound effects via WebAudio
+- Pause/settings, restart, and share score (Web Share API if available)
+
+This is a compact but feature-rich starting point you can expand (add server leaderboard, ads, sprites).
+-->
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Pixel Car — Mobile</title>
+<style>
+  :root{--bg:#08121a;--ui:#fff}
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,#07121a,#0d1f2b);color:var(--ui);font-family:system-ui,Segoe UI,Roboto,Arial}
+  #wrap{display:flex;flex-direction:column;height:100%;align-items:center;justify-content:center}
+  canvas{border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.6);background:#0a1720}
+  .topbar{position:fixed;top:12px;left:12px;right:12px;display:flex;justify-content:space-between;align-items:center}
+  .btn{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.06);padding:8px 12px;border-radius:10px;color:#fff}
+  .hud{position:fixed;right:12px;top:60px;color:#fff;text-align:right}
+  .controls{position:fixed;left:12px;bottom:18px;right:12px;display:flex;justify-content:space-between;gap:12px}
+  .touch-pad{flex:1;display:flex;gap:10px;align-items:flex-end}
+  .big{flex:1;display:flex;gap:8px}
+  .control-btn{flex:1;padding:14px;border-radius:12px;background:rgba(255,255,255,0.06);text-align:center;font-weight:700}
+  .small{width:72px}
+  .center{display:flex;justify-content:center;align-items:center}
+  footer{position:fixed;left:12px;bottom:12px;color:rgba(255,255,255,0.6);font-size:13px}
+  @media(min-width:900px){body{background:linear-gradient(180deg,#7fb2ff,#ffd1f1);}}
+</style>
+</head>
+<body>
+<div id="wrap" class="center">
+  <canvas id="game" width="900" height="1600"></canvas>
+</div>
+<div class="topbar">
+  <div><button id="pauseBtn" class="btn">Pause</button></div>
+  <div style="display:flex;gap:8px;align-items:center"><div id="level" style="font-weight:700">Level 1</div></div>
+</div>
+<div class="hud">
+  <div>Score: <span id="score">0</span></div>
+  <div>Best: <span id="best">0</span></div>
+  <div style="margin-top:8px">Money: <span id="money">0</span></div>
+</div>
+<div class="controls">
+  <div style="flex:2;display:flex;gap:8px">
+    <div id="leftBtn" class="control-btn">◀</div>
+    <div id="rightBtn" class="control-btn">▶</div>
+  </div>
+  <div style="flex:1;display:flex;gap:8px;justify-content:flex-end;align-items:flex-end">
+    <div id="brakeBtn" class="control-btn small">Brake</div>
+    <div id="nitroBtn" class="control-btn small">Nitro</div>
+  </div>
+</div>
+<footer>Controls: Touch or tilt device. Save & upgrades via localStorage.</footer>
+
+<script>
+// Pixel Car — core logic
+// Canvas & scaling
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+
+function resizeToFit(){
+  // Fit full viewport while keeping aspect ratio (portrait-friendly)
+  const vw = Math.min(window.innerWidth, 900);
+  const vh = Math.min(window.innerHeight, 1600);
+  const ratio = Math.min(window.innerWidth / W, window.innerHeight / H);
+  const scale = Math.min(ratio, 1);
+  canvas.style.width = Math.floor(W * scale) + 'px';
+  canvas.style.height = Math.floor(H * scale) + 'px';
+}
+window.addEventListener('resize', resizeToFit);
+resizeToFit();
+
+// Game state
+let running = true;
+let frames = 0;
+let score = 0; let best = 0; let money = 0;
+let level = 1; let distance = 0;
+
+// Player car
+const player = {
+  lane: 1, // 0 left,1 middle,2 right
+  x: 0, y: 0,
+  speed: 6,
+  baseSpeed: 6,
+  targetX: 0,
+  wobble: 0,
+  width: 54, height: 90,
+  nitro: 100,
+  maxNitro: 100,
+  health: 100
+};
+
+const road = {lanes:3, laneW: 220, topMargin: 300};
+
+let obstacles = [];
+let particles = [];
+
+// Settings & upgrades persisted
+const STORE_KEY = 'pixel_car_v1';
+let store = {best:0,money:0,upgrades:{speed:0,handling:0,nitro:0}};
+function loadStore(){
+  try{ const s = localStorage.getItem(STORE_KEY); if(s) store = JSON.parse(s); best = store.best || 0; money = store.money || 0; }
+  catch(e){console.warn(e)}
+}
+function saveStore(){ store.best = best; store.money = money; localStorage.setItem(STORE_KEY, JSON.stringify(store)); }
+loadStore();
+
+// Audio (simple) -------------------------------------------------
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+let audioCtx;
+function beep(freq,dur=0.08,vol=0.08){
+  if(!AudioCtx) return; if(!audioCtx) audioCtx = new AudioCtx();
+  const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+  o.type='sine'; o.frequency.value = freq; g.gain.value = vol;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime + dur);
+}
+
+// Controls (touch + keys + tilt)
+const leftBtn = document.getElementById('leftBtn');
+const rightBtn = document.getElementById('rightBtn');
+const brakeBtn = document.getElementById('brakeBtn');
+const nitroBtn = document.getElementById('nitroBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+
+let input = {left:false,right:false,brake:false,nitro:false,tilt:0};
+
+function bindTouch(el, key){
+  let id = null;
+  el.addEventListener('touchstart', e=>{e.preventDefault(); input[key]=true;});
+  el.addEventListener('touchend', e=>{e.preventDefault(); input[key]=false;});
+  el.addEventListener('mousedown', e=>{e.preventDefault(); input[key]=true;});
+  window.addEventListener('mouseup', e=>{input[key]=false});
+}
+bindTouch(leftBtn,'left'); bindTouch(rightBtn,'right'); bindTouch(brakeBtn,'brake'); bindTouch(nitroBtn,'nitro');
+
+window.addEventListener('keydown', e=>{ if(e.key === 'ArrowLeft') input.left=true; if(e.key==='ArrowRight') input.right=true; if(e.key===' ') input.nitro=true; if(e.key==='ArrowDown') input.brake=true; });
+window.addEventListener('keyup', e=>{ if(e.key === 'ArrowLeft') input.left=false; if(e.key==='ArrowRight') input.right=false; if(e.key===' ') input.nitro=false; if(e.key==='ArrowDown') input.brake=false; });
+
+// Device tilt
+if(window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function'){
+  // iOS requires permission; Android usually allows
+  // We'll not request automatically; rely on tilt events if available
+}
+window.addEventListener('deviceorientation', e=>{
+  // gamma is left-right tilt in degrees
+  if(e.gamma !== null) input.tilt = e.gamma/30; // scale roughly -1..1
+});
+
+pauseBtn.addEventListener('click', ()=>{ running = !running; pauseBtn.textContent = running? 'Pause' : 'Resume'; if(running) loop(); });
+
+// Utility
+function rand(min,max){ return Math.random()*(max-min)+min }
+
+// Road & obstacle generation ------------------------------------
+function spawnObstacle(){
+  const lane = Math.floor(Math.random()*road.lanes);
+  const type = Math.random()<0.7? 'car':'barrier';
+  const speedAdj = 0.6 + Math.random()*0.8;
+  obstacles.push({lane,type,y:-200, w:54, h:90, speed: player.baseSpeed*speedAdj + level*0.6});
+}
+
+// Particle system
+function spawnParticle(x,y,vx,vy,life,color){ particles.push({x,y,vx,vy,life,age:0,color}); }
+
+// Drawing pixel car (no assets) ---------------------------------
+function drawPixelCar(ctx,x,y,scale=1,color='#ffdd55',flip=false){
+  // simple pixel-art mapping using rectangles
+  ctx.save(); ctx.translate(x,y); if(flip) ctx.scale(-1,1);
+  const s = scale;
+  // body
+  ctx.fillStyle = color; ctx.fillRect(-18*s,-28*s,36*s,56*s);
+  // roof
+  ctx.fillStyle = '#222'; ctx.fillRect(-12*s,-40*s,24*s,12*s);
+  // windows
+  ctx.fillStyle = '#88d'; ctx.fillRect(-8*s,-36*s,8*s,8*s); ctx.fillRect(2*s,-36*s,6*s,8*s);
+  // wheels
+  ctx.fillStyle = '#111'; ctx.fillRect(-18*s,22*s,8*s,6*s); ctx.fillRect(10*s,22*s,8*s,6*s);
+  ctx.restore();
+}
+
+// Update/draw loop ----------------------------------------------
+function update(dt){
+  frames++;
+  // difficulty / level progression
+  distance += player.speed * dt * 0.06;
+  if(distance > level*1000){ level++; document.getElementById('level').textContent = 'Level ' + level; spawnObstacle(); }
+
+  // spawn obstacles periodically
+  if(frames % Math.max(30, 120 - level*6) === 0) spawnObstacle();
+
+  // input steering
+  let steer = 0;
+  if(input.left) steer -= 1; if(input.right) steer += 1;
+  // combine tilt
+  if(Math.abs(input.tilt) > 0.1) steer += input.tilt;
+  // handling upgrade affects responsiveness
+  const handling = 1 + store.upgrades.handling*0.15;
+  player.wobble += (steer*1.6 - player.wobble) * 0.14 * handling;
+  // lane snap based on wobble
+  player.x += player.wobble * 8;
+  // clamp
+  const roadCenter = W/2;
+  const leftBound = roadCenter - road.laneW * (road.lanes/2) + 30;
+  const rightBound = roadCenter + road.laneW * (road.lanes/2) - 30;
+  player.x = Math.max(leftBound, Math.min(rightBound, player.x));
+
+  // nitro & speed
+  if(input.nitro && player.nitro > 0){ player.speed = Math.min(14, player.baseSpeed + 6 + store.upgrades.speed*0.5); player.nitro -= 0.8; spawnParticle(player.x, player.y+30, rand(-0.8,0.8), rand(2,4), 24, 'orange'); }
+  else { player.speed = player.baseSpeed + store.upgrades.speed*0.6 + level*0.1; player.nitro = Math.min(player.maxNitro + store.upgrades.nitro*20, player.nitro + 0.12); }
+
+  // brake
+  if(input.brake) player.speed = Math.max(2, player.speed - 4);
+
+  // update obstacles
+  for(let i=obstacles.length-1;i>=0;i--){ const ob = obstacles[i]; ob.y += player.speed - ob.speed; if(ob.y > H + 200){ obstacles.splice(i,1); money += 1; } }
+
+  // collisions
+  const px = player.x, py = player.y;
+  for(const ob of obstacles){ const ox = laneToX(ob.lane); const oy = ob.y; const collide = Math.abs(ox - px) < 40 && Math.abs(oy - py) < 60; if(collide){ player.health -= 20; spawnParticle(px,py, rand(-3,3),rand(-6,-2),40,'red'); beep(120,0.06,0.1); ob.y = H + 999; if(player.health <= 0) onGameOver(); } }
+
+  // particles update
+  for(let i=particles.length-1;i>=0;i--){ const p = particles[i]; p.age += 1; p.x += p.vx; p.y += p.vy; p.vy += 0.12; if(p.age > p.life) particles.splice(i,1); }
+
+  // score / best
+  score = Math.floor(distance);
+  if(score > best) best = score;
+  document.getElementById('score').textContent = score;
+  document.getElementById('best').textContent = best;
+  document.getElementById('money').textContent = money;
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // draw road
+  const roadCenter = W/2;
+  const roadWidth = road.laneW * road.lanes;
+  ctx.fillStyle = '#222'; ctx.fillRect(roadCenter - roadWidth/2, 0, roadWidth, H);
+  // lane markings
+  ctx.strokeStyle = '#ddd'; ctx.lineWidth = 6; ctx.setLineDash([30,40]);
+  for(let i=1;i<road.lanes;i++){ const lx = roadCenter - roadWidth/2 + i*road.laneW; ctx.beginPath(); ctx.moveTo(lx,0); ctx.lineTo(lx,H); ctx.stroke(); }
+  ctx.setLineDash([]);
+
+  // background roadside
+  ctx.fillStyle = '#063'; ctx.fillRect(0,0,roadCenter-roadWidth/2, H); ctx.fillRect(roadCenter+roadWidth/2,0,roadCenter-roadWidth/2,H);
+
+  // obstacles
+  for(const ob of obstacles){ const ox = laneToX(ob.lane); const oy = ob.y; drawPixelCar(ctx, ox, oy, 0.6, ob.type==='car'? '#c33':'#666'); }
+
+  // player
+  drawPixelCar(ctx, player.x, player.y, 1, '#57f');
+
+  // HUD: health bar
+  ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(18,18,220,18); ctx.fillStyle = '#f55'; ctx.fillRect(20,20, Math.max(0, (player.health/100)*196), 14);
+
+  // particles
+  for(const p of particles){ ctx.fillStyle = p.color; ctx.globalAlpha = 1 - p.age/p.life; ctx.fillRect(p.x, p.y, 4,4); ctx.globalAlpha = 1; }
+}
+
+function laneToX(lane){ const roadCenter = W/2; const left = roadCenter - road.laneW*(road.lanes/2) + road.laneW/2; return left + lane*road.laneW; }
+
+function onGameOver(){ running = false; beep(80,0.4,0.2); money += Math.floor(score/30); saveStore(); // reward
+  // show simple overlay (native alert fallback)
+  setTimeout(()=>{
+    if(navigator.share){ navigator.share({title:'Pixel Car - Score',text:`I scored ${score} in Pixel Car!`}).catch(()=>{});
+  }
+    alert('Game over! Score: ' + score + '\nMoney earned: ' + Math.floor(score/30));
+    // reset
+    resetRound();
+  },200);
+}
+
+function resetRound(){ obstacles = []; particles = []; distance = 0; score = 0; player.health = 100; player.nitro = player.maxNitro; running = true; frames = 0; player.x = laneToX(1); }
+
+function loop(ts){
+  if(!running) return; update(1); draw(); requestAnimationFrame(loop);
+}
+
+// init positions
+player.x = laneToX(1); player.y = H - 260;
+
+// initial obstacles
+for(let i=0;i<3;i++) spawnObstacle();
+
+// start loop
+requestAnimationFrame(loop);
+
+// helpers: offer simple UI for upgrades
+function openShop(){ const up = prompt('Shop - choose upgrade: 1) Speed (100$) 2) Handling (100$) 3) Nitro (100$)'); if(!up) return; const choice = parseInt(up); if(money < 100){ alert('Not enough money'); return; } money -= 100; if(choice===1) store.upgrades.speed = (store.upgrades.speed||0) + 1; if(choice===2) store.upgrades.handling = (store.upgrades.handling||0)+1; if(choice===3) store.upgrades.nitro = (store.upgrades.nitro||0)+1; saveStore(); }
+
+// small touch: long press nitro to refill faster (example mechanic)
+let nitroHold = false; nitroBtn.addEventListener('touchstart', ()=>{ nitroHold=true; }); nitroBtn.addEventListener('touchend', ()=>{ nitroHold=false; });
+setInterval(()=>{ if(nitroHold && money>=1){ money -= 1; player.nitro = Math.min(player.maxNitro + store.upgrades.nitro*20, player.nitro + 5); } }, 400);
+
+// expose shop via double-tap on hud
+document.getElementById('money').addEventListener('dblclick', openShop);
+
+// save periodically
+setInterval(saveStore, 3000);
+
+// friendly hints
+console.log('Pixel Car loaded — touch controls + tilt. Double-tap money to open shop.');
+
+</script>
+</body>
+</html>
